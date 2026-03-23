@@ -11,8 +11,6 @@ import {
   CheckCircle, Lock, User, Eye, EyeOff, AlertCircle,
 } from 'lucide-react';
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
-
 // ─────────────────────────────────────────────────────────────
 // GLOBAL API FETCH — auto-logout on 401, always sends token
 // ─────────────────────────────────────────────────────────────
@@ -51,7 +49,7 @@ const LoginPage: React.FC<{ onLogin: (t: string, u: string) => void }> = ({ onLo
     e.preventDefault();
     setLoading(true); setError('');
     try {
-      const res = await fetch(`${API_BASE_URL}/api/login`, {
+      const res = await fetch('http://localhost:8000/api/login', {
         method:  'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body:    `username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`,
@@ -226,12 +224,12 @@ const DashboardHome: React.FC = () => {
   const [showReport,  setShowReport]  = useState(false);
 
   useEffect(() => {
-    apiFetch('${API_BASE_URL}/api/clients')
+    apiFetch('http://localhost:8000/api/clients')
       .then(r => r.json()).then(d => setClientCount(Array.isArray(d) ? d.length : 0)).catch(() => {});
   }, []);
 
   const fetchReport = (type: 'monthly' | 'quarterly') => {
-    apiFetch(`${API_BASE_URL}/api/reports/${type}`)
+    apiFetch(`http://localhost:8000/api/reports/${type}`)
       .then(r => r.json()).then(d => { setReportData(d); setShowReport(true); }).catch(() => {});
   };
 
@@ -378,7 +376,7 @@ const ClientsPage: React.FC = () => {
   const [form, setForm] = useState({ name:'', email:'', phone:'', investment_profile:'Moderate' });
 
   const loadClients = useCallback(() => {
-    apiFetch('${API_BASE_URL}/api/clients')
+    apiFetch('http://localhost:8000/api/clients')
       .then(r => r.json()).then(d => setClients(Array.isArray(d) ? d : [])).catch(() => {});
   }, []);
 
@@ -389,7 +387,7 @@ const ClientsPage: React.FC = () => {
     if (saving) return;
     setSaving(true); setFormErr('');
     try {
-      const res = await apiFetch('${API_BASE_URL}/api/register', {
+      const res = await apiFetch('http://localhost:8000/api/register', {
         method: 'POST',
         body:   JSON.stringify(form),
       });
@@ -498,8 +496,8 @@ const PortfoliosPage: React.FC = () => {
   const [form, setForm] = useState({ client_id:'', assets:'60% Stocks, 40% Bonds', value:'' });
 
   const loadData = useCallback(() => {
-    apiFetch('${API_BASE_URL}/api/clients').then(r => r.json()).then(d => setClients(Array.isArray(d) ? d : [])).catch(() => {});
-    apiFetch('${API_BASE_URL}/api/portfolios').then(r => r.json()).then(d => setPortfolios(Array.isArray(d) ? d : [])).catch(() => {});
+    apiFetch('http://localhost:8000/api/clients').then(r => r.json()).then(d => setClients(Array.isArray(d) ? d : [])).catch(() => {});
+    apiFetch('http://localhost:8000/api/portfolios').then(r => r.json()).then(d => setPortfolios(Array.isArray(d) ? d : [])).catch(() => {});
   }, []);
 
   useEffect(() => { loadData(); }, [loadData]);
@@ -509,7 +507,7 @@ const PortfoliosPage: React.FC = () => {
     if (saving) return;
     setSaving(true); setFormErr('');
     try {
-      const res = await apiFetch('${API_BASE_URL}/api/portfolios', {
+      const res = await apiFetch('http://localhost:8000/api/portfolios', {
         method: 'POST',
         body:   JSON.stringify({ client_id: parseInt(form.client_id), assets: form.assets, value: parseFloat(form.value), risk_score: 5.0 }),
       });
@@ -598,7 +596,7 @@ const PortfoliosPage: React.FC = () => {
 const ServicesPage: React.FC = () => {
   const [services, setServices] = useState<any[]>([]);
   useEffect(() => {
-    fetch('${API_BASE_URL}/api/services')   // no auth needed
+    fetch('http://localhost:8000/api/services')   // no auth needed
       .then(r => r.json()).then(d => setServices(Array.isArray(d) ? d : [])).catch(() => {});
   }, []);
   return (
@@ -629,8 +627,8 @@ const MeetingsPage: React.FC = () => {
   const [form, setForm] = useState({ client_id:'', datetime:'', advisor:'Admin' });
 
   const loadData = useCallback(() => {
-    apiFetch('${API_BASE_URL}/api/clients').then(r => r.json()).then(d => setClients(Array.isArray(d) ? d : [])).catch(() => {});
-    apiFetch('${API_BASE_URL}/api/meeting').then(r => r.json()).then(d => setMeetings(Array.isArray(d) ? d : [])).catch(() => {});
+    apiFetch('http://localhost:8000/api/clients').then(r => r.json()).then(d => setClients(Array.isArray(d) ? d : [])).catch(() => {});
+    apiFetch('http://localhost:8000/api/meetings').then(r => r.json()).then(d => setMeetings(Array.isArray(d) ? d : [])).catch(() => {});
   }, []);
 
   useEffect(() => { loadData(); }, [loadData]);
@@ -640,7 +638,7 @@ const MeetingsPage: React.FC = () => {
     if (saving) return;
     setSaving(true); setFormErr('');
     try {
-      const res = await apiFetch('${API_BASE_URL}/api/meeting', {
+      const res = await apiFetch('http://localhost:8000/api/meeting', {
         method: 'POST',
         body:   JSON.stringify({ client_id: parseInt(form.client_id), datetime: form.datetime, advisor: form.advisor }),
       });
