@@ -1,10 +1,13 @@
 'use client';
 
 import React, { useState, useRef, useEffect } from 'react';
-import { MessageCircle, X, Send, Mic, MicOff, Paperclip, TrendingUp, Bot, Sparkles, FileText, Image, File } from 'lucide-react';
+import {
+  MessageCircle, X, Send, Mic, MicOff, Paperclip,
+  TrendingUp, Bot, Sparkles, FileText, Image, File,
+} from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 
-// ─── Types ───────────────────────────────────────────────────
+// ─── Types ────────────────────────────────────────────────────
 interface Message {
   id:        string;
   type:      'ai' | 'user' | 'service-card' | 'thinking';
@@ -19,7 +22,7 @@ interface Message {
   };
 }
 
-// ─── Web Speech API type declarations ────────────────────────
+// ─── Web Speech API shim ──────────────────────────────────────
 declare global {
   interface Window {
     SpeechRecognition: any;
@@ -27,7 +30,7 @@ declare global {
   }
 }
 
-// ─── Thinking animation ───────────────────────────────────────
+// ─── Thinking bubble ──────────────────────────────────────────
 const ThinkingBubble: React.FC = () => (
   <div className="cw-thinking-row">
     <div className="cw-avatar">
@@ -47,17 +50,20 @@ const ThinkingBubble: React.FC = () => (
 
 // ─── File icon helper ─────────────────────────────────────────
 const FileIcon: React.FC<{ mime: string }> = ({ mime }) => {
-  if (mime.startsWith('image/')) return <Image size={14} />;
-  if (mime === 'application/pdf') return <FileText size={14} />;
+  if (mime.startsWith('image/'))       return <Image    size={14} />;
+  if (mime === 'application/pdf')      return <FileText size={14} />;
   return <File size={14} />;
 };
 
-// ─── Main Widget ──────────────────────────────────────────────
+// ─── Main widget ──────────────────────────────────────────────
 export default function ChatWidget() {
   const [isOpen,      setIsOpen]      = useState(false);
   const [messages,    setMessages]    = useState<Message[]>([{
     id: '1', type: 'ai',
-    content: 'Hello! I am your **Pro Finance AI Analyst**. My secure neural link is active.\n\nAsk me about clients, portfolios, meetings, or any financial topic.\n\n🎤 You can also use **voice input** or **upload a file** to ask questions.',
+    content:
+      'Hello! I am your **Pro Finance AI Analyst**. My secure neural link is active.\n\n' +
+      'Ask me about clients, portfolios, meetings, or any financial topic.\n\n' +
+      '🎤 You can also use **voice input** or **upload a file** to ask questions.',
   }]);
   const [input,       setInput]       = useState('');
   const [isLoading,   setIsLoading]   = useState(false);
@@ -65,108 +71,171 @@ export default function ChatWidget() {
   const [micError,    setMicError]    = useState('');
   const [attachment,  setAttachment]  = useState<{ name: string; type: string; text: string } | null>(null);
 
-  const bottomRef    = useRef<HTMLDivElement>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const recognitionRef = useRef<any>(null);
+  const bottomRef      = useRef<HTMLDivElement>(null);
+  const fileInputRef   = useRef<HTMLInputElement>(null);
 
+  // The ONE source of truth for the recognition instance.
+  const recRef         = useRef<any>(null);
+  // Mirrors isListening but always up-to-date inside async callbacks.
+  const listeningRef   = useRef(false);
+  // Accumulates transcript chunks across continuous results.
+  const transcriptRef  = useRef('');
+  // Prevents the "aborted" onerror from showing a banner when we stopped deliberately.
+  const stoppingRef    = useRef(false);
+
+  // Scroll to bottom whenever messages change
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isOpen]);
 
-  // ── Speech-to-Text ─────────────────────────────────────────
-  const startListening = () => {
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => { forceStopRec(); };
+  }, []);
 
-    if (!SpeechRecognition) {
-      setMicError('Voice input not supported in this browser. Try Chrome.');
-      setTimeout(() => setMicError(''), 3000);
+  // ── Helpers ──────────────────────────────────────────────────
+  const setListening = (val: boolean) => {
+    listeningRef.current = val;
+    setIsListening(val);
+  };
+
+  const forceStopRec = () => {
+    if (recRef.current) {
+      stoppingRef.current = true;
+      try { recRef.current.stop(); }  catch { /* ignore */ }
+      try { recRef.current.abort(); } catch { /* ignore */ }
+      recRef.current = null;
+    }
+    setListening(false);
+  };
+
+  // ── Toggle mic ───────────────────────────────────────────────
+  const toggleMic = () => {
+    // ── STOP ────────────────────────────────────────────────
+    if (listeningRef.current) {
+      forceStopRec();
       return;
     }
 
-    if (isListening) {
-      // Stop if already listening
-      recognitionRef.current?.stop();
-      setIsListening(false);
+    // ── START ────────────────────────────────────────────────
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      setMicError('Voice input not supported. Use Chrome or Edge.');
+      setTimeout(() => setMicError(''), 4000);
       return;
     }
 
-    const recognition = new SpeechRecognition();
-    recognitionRef.current = recognition;
+    // Clean slate
+    forceStopRec();
+    stoppingRef.current   = false;
+    transcriptRef.current = '';
 
-    recognition.lang            = 'en-US';
-    recognition.continuous      = false;
-    recognition.interimResults  = false;
-    recognition.maxAlternatives = 1;
+    const rec = new SR();
+    recRef.current = rec;
 
-    recognition.onstart = () => {
-      setIsListening(true);
+    rec.lang            = 'en-US';
+    rec.continuous      = true;   // keep alive until WE stop it
+    rec.interimResults  = true;   // show partial results so user sees it working
+    rec.maxAlternatives = 1;
+
+    rec.onstart = () => {
+      setListening(true);
       setMicError('');
     };
 
-    recognition.onresult = (event: any) => {
-      const transcript = event.results[0][0].transcript;
-      setInput(prev => prev ? `${prev} ${transcript}` : transcript);
-      setIsListening(false);
-    };
-
-    recognition.onerror = (event: any) => {
-      setIsListening(false);
-      if (event.error === 'not-allowed') {
-        setMicError('Microphone access denied. Allow mic in browser settings.');
-      } else if (event.error === 'no-speech') {
-        setMicError('No speech detected. Try again.');
-      } else {
-        setMicError(`Voice error: ${event.error}`);
+    // Build up transcript from interim + final chunks
+    rec.onresult = (event: any) => {
+      let interim    = '';
+      let finalChunk = '';
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const res = event.results[i];
+        if (res.isFinal) {
+          finalChunk += res[0].transcript;
+        } else {
+          interim += res[0].transcript;
+        }
       }
-      setTimeout(() => setMicError(''), 3000);
+      // Commit final chunks to our accumulator
+      if (finalChunk) {
+        transcriptRef.current = (transcriptRef.current + ' ' + finalChunk).trim();
+      }
+      // Show live preview in the input box (accumulator + current interim)
+      const live = (transcriptRef.current + ' ' + interim).trim();
+      setInput(live);
     };
 
-    recognition.onend = () => {
-      setIsListening(false);
+    rec.onerror = (event: any) => {
+      // Ignore errors from our own deliberate stop/abort
+      if (stoppingRef.current || event.error === 'aborted') return;
+
+      let msg = '';
+      if (event.error === 'not-allowed' || event.error === 'permission-denied') {
+        msg = 'Microphone access denied. Allow mic in browser settings and reload.';
+      } else if (event.error === 'no-speech') {
+        msg = 'No speech detected. Please try again.';
+      } else if (event.error === 'network') {
+        msg = 'Network error with speech service. Check your connection.';
+      } else if (event.error === 'audio-capture') {
+        msg = 'No microphone found. Connect one and try again.';
+      } else {
+        msg = `Voice error: ${event.error}`;
+      }
+      setMicError(msg);
+      setTimeout(() => setMicError(''), 5000);
+      setListening(false);
+      recRef.current = null;
     };
 
-    recognition.start();
+    rec.onend = () => {
+      // If we stopped deliberately, state is already reset — nothing to do.
+      if (stoppingRef.current) {
+        stoppingRef.current = false;
+        recRef.current      = null;
+        return;
+      }
+      // Browser ended on its own (silence timeout etc.) — just reset.
+      setListening(false);
+      recRef.current = null;
+    };
+
+    try {
+      rec.start();
+    } catch (err: any) {
+      setMicError('Could not start microphone. Check browser permissions.');
+      setTimeout(() => setMicError(''), 4000);
+      setListening(false);
+      recRef.current = null;
+    }
   };
 
-  // ── File Upload ─────────────────────────────────────────────
+  // ── File upload ───────────────────────────────────────────────
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-
-    // Reset input so same file can be re-selected
     e.target.value = '';
 
-    const MAX_SIZE = 5 * 1024 * 1024; // 5MB
-    if (file.size > MAX_SIZE) {
-      setMicError('File too large. Max 5MB.');
+    if (file.size > 5 * 1024 * 1024) {
+      setMicError('File too large. Max 5 MB.');
       setTimeout(() => setMicError(''), 3000);
       return;
     }
 
     try {
       let extractedText = '';
+      const textExts = ['.txt','.csv','.md','.json','.xml','.yaml','.yml','.html','.htm','.log'];
+      const isText   = file.type.startsWith('text/') || textExts.some(x => file.name.toLowerCase().endsWith(x));
 
-      const textExtensions = ['.txt','.csv','.md','.json','.xml','.yaml','.yml','.html','.htm','.log'];
-      const isTextFile = file.type.startsWith('text/') || textExtensions.some(ext => file.name.toLowerCase().endsWith(ext));
-      if (isTextFile) {
-        // Plain text / CSV — read directly
+      if (isText) {
         extractedText = await file.text();
-        if (extractedText.length > 3000) {
-          extractedText = extractedText.slice(0, 3000) + '\n...[truncated]';
-        }
+        if (extractedText.length > 3000) extractedText = extractedText.slice(0, 3000) + '\n...[truncated]';
       } else if (file.type.startsWith('image/')) {
-        // Image — tell the AI the filename and ask it to analyse based on name
         extractedText = `[Image uploaded: ${file.name}]`;
       } else if (file.type === 'application/pdf') {
-        // PDF — use FileReader to get raw text (basic extraction)
         extractedText = await extractPdfText(file);
       } else {
-        // Unsupported — try to read as text anyway
         try {
           extractedText = await file.text();
-          if (extractedText.length > 3000) {
-            extractedText = extractedText.slice(0, 3000) + '\n...[truncated]';
-          }
+          if (extractedText.length > 3000) extractedText = extractedText.slice(0, 3000) + '\n...[truncated]';
         } catch {
           extractedText = `[File: ${file.name} — could not read content]`;
         }
@@ -174,73 +243,57 @@ export default function ChatWidget() {
 
       setAttachment({ name: file.name, type: file.type, text: extractedText });
 
-      // Smart auto-prompt based on file category
-      const ext      = file.name.toLowerCase().split('.').pop() || '';
-      const isImage  = file.type.startsWith('image/');
-      const isSpread = ['xls','xlsx','csv'].includes(ext);
-      const isSlide  = ['ppt','pptx'].includes(ext);
-      const isWord   = ['doc','docx'].includes(ext);
-      const isCode   = ['json','xml','yaml','yml','html','htm','log'].includes(ext);
-      const isMd     = ext === 'md';
-
+      const ext = file.name.toLowerCase().split('.').pop() || '';
       const autoPrompt =
-        isImage  ? `I've uploaded the image "${file.name}". Based on its filename, what type of image might this be and what context can you provide?`
-        : isSpread ? `I've uploaded the spreadsheet "${file.name}". Please analyse the data and give me a summary of the key figures and trends.`
-        : isSlide  ? `I've uploaded the presentation "${file.name}". Please summarise the key points from the content.`
-        : isWord   ? `I've uploaded the document "${file.name}". Please give me a clear summary of the key information.`
-        : isCode   ? `I've uploaded the file "${file.name}". Please analyse the structure and content and explain what it represents.`
-        : isMd     ? `I've uploaded the markdown file "${file.name}". Please summarise the content and highlight the main points.`
-        : `I've uploaded "${file.name}". Please analyse the content and give me a brief summary.`;
+        file.type.startsWith('image/')                                        ? `I've uploaded the image "${file.name}". What context can you provide based on the filename?`
+        : ['xls','xlsx','csv'].includes(ext)                                  ? `I've uploaded the spreadsheet "${file.name}". Please analyse the data and summarise key figures and trends.`
+        : ['ppt','pptx'].includes(ext)                                        ? `I've uploaded the presentation "${file.name}". Please summarise the key points.`
+        : ['doc','docx'].includes(ext)                                        ? `I've uploaded the document "${file.name}". Please give me a clear summary.`
+        : ['json','xml','yaml','yml','html','htm','log'].includes(ext)        ? `I've uploaded "${file.name}". Please analyse the structure and explain what it represents.`
+        : ext === 'md'                                                        ? `I've uploaded the markdown file "${file.name}". Please summarise and highlight the main points.`
+        : `I've uploaded "${file.name}". Please analyse the content and give a brief summary.`;
 
       setInput(prev => prev || autoPrompt);
-    } catch (err) {
+    } catch {
       setMicError('Could not read file. Try a .txt or .pdf file.');
       setTimeout(() => setMicError(''), 3000);
     }
   };
 
-  // Basic PDF text extraction using FileReader
-  const extractPdfText = (file: File): Promise<string> => {
-    return new Promise((resolve) => {
+  const extractPdfText = (file: File): Promise<string> =>
+    new Promise(resolve => {
       const reader = new FileReader();
-      reader.onload = (e) => {
+      reader.onload = e => {
         try {
-          const binary = e.target?.result as string;
-          // Extract readable text from PDF binary stream
-          const textMatches = binary.match(/\(([^)]{1,200})\)/g) || [];
-          const extracted   = textMatches
+          const binary  = e.target?.result as string;
+          const matches = binary.match(/\(([^)]{1,200})\)/g) || [];
+          const text    = matches
             .map(s => s.slice(1, -1))
-            .filter(s => /[a-zA-Z]{2,}/.test(s))   // keep only human-readable strings
+            .filter(s => /[a-zA-Z]{2,}/.test(s))
             .join(' ')
             .replace(/\\n/g, '\n')
             .replace(/\\/g, '');
-
-          const result = extracted.length > 100
-            ? (extracted.length > 3000 ? extracted.slice(0, 3000) + '\n...[truncated]' : extracted)
-            : `[PDF: ${file.name} — text extraction limited. Content may be image-based.]`;
-
-          resolve(result);
-        } catch {
-          resolve(`[PDF: ${file.name}]`);
-        }
+          resolve(
+            text.length > 100
+              ? text.length > 3000 ? text.slice(0, 3000) + '\n...[truncated]' : text
+              : `[PDF: ${file.name} — text extraction limited. Content may be image-based.]`
+          );
+        } catch { resolve(`[PDF: ${file.name}]`); }
       };
       reader.onerror = () => resolve(`[PDF: ${file.name} — read error]`);
       reader.readAsBinaryString(file);
     });
-  };
 
-  // ── Remove attachment ───────────────────────────────────────
-  const removeAttachment = () => {
-    setAttachment(null);
-    setInput('');
-  };
+  const removeAttachment = () => { setAttachment(null); setInput(''); };
 
-  // ── Send message ────────────────────────────────────────────
+  // ── Send ─────────────────────────────────────────────────────
   const send = async () => {
     const text = input.trim();
     if (!text || isLoading) return;
 
-    // Build message — trim file content so Ollama doesn't time out
+    // Stop mic if still active before sending
+    if (listeningRef.current) forceStopRec();
+
     const fileContent = attachment?.text
       ? attachment.text.slice(0, 1500) + (attachment.text.length > 1500 ? '\n...[truncated for speed]' : '')
       : '';
@@ -249,29 +302,28 @@ export default function ChatWidget() {
       : text;
 
     const userMsg: Message = {
-      id: Date.now().toString(),
-      type: 'user',
-      content: text,  // display only the user's text, not the full file
+      id: Date.now().toString(), type: 'user', content: text,
       ...(attachment ? { attachment: { name: attachment.name, type: attachment.type } } : {}),
     };
     const thinkId = `think-${Date.now()}`;
 
     setMessages(prev => [...prev, userMsg, { id: thinkId, type: 'thinking' }]);
     setInput('');
+    transcriptRef.current = '';
     setAttachment(null);
     setIsLoading(true);
 
     try {
       const token      = localStorage.getItem('token') || '';
       const controller = new AbortController();
-      const timeoutId  = setTimeout(() => controller.abort(), 90000); // 90s timeout
+      const tid        = setTimeout(() => controller.abort(), 90000);
       const res = await fetch('http://localhost:8000/api/chat', {
         method:  'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body:    JSON.stringify({ message: fullMessage }),
         signal:  controller.signal,
       });
-      clearTimeout(timeoutId);
+      clearTimeout(tid);
       const data  = await res.json();
       const reply = data.reply || data.detail || '⚠️ No response received.';
 
@@ -298,7 +350,7 @@ export default function ChatWidget() {
         {
           id: thinkId, type: 'ai',
           content: isTimeout
-            ? '⚠️ **AI is taking too long.** The model is busy or the file is too large.\n\nTry:\n- Ask a shorter question\n- Upload a smaller file\n- Run `ollama run llama3.2:1b` in terminal'
+            ? '⚠️ **AI is taking too long.**\n\nTry:\n- Ask a shorter question\n- Upload a smaller file\n- Run `ollama run llama3.2:1b` in terminal'
             : '⚠️ **Connection Error** — ensure the backend is running on port 8000.',
         },
       ]);
@@ -307,19 +359,17 @@ export default function ChatWidget() {
     }
   };
 
-  // ── Render ──────────────────────────────────────────────────
+  // ── Render ────────────────────────────────────────────────────
   return (
     <>
-      {/* Hidden file input */}
       <input
-        ref={fileInputRef}
-        type="file"
+        ref={fileInputRef} type="file"
         accept=".txt,.csv,.pdf,.md,.png,.jpg,.jpeg,.webp,.gif,.bmp,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.json,.xml,.yaml,.yml,.html,.htm,.log"
         style={{ display: 'none' }}
         onChange={handleFileSelect}
       />
 
-      {/* ── Chat window ─────────────────────────────────────── */}
+      {/* ── Chat window ──────────────────────────────────────── */}
       {isOpen && (
         <div className="cw-window">
 
@@ -332,7 +382,7 @@ export default function ChatWidget() {
               <div>
                 <p className="cw-header-title">Finance AI Analyst</p>
                 <div className="cw-header-status">
-                  <span className="cw-status-dot" />
+                  <span className={`cw-status-dot ${isListening ? 'cw-status-dot-mic' : ''}`} />
                   <span className="cw-status-text">
                     {isListening ? 'Listening…' : 'Online'}
                   </span>
@@ -378,7 +428,6 @@ export default function ChatWidget() {
                     </div>
                   )}
                   <div className={`cw-bubble ${isUser ? 'cw-bubble-user' : 'cw-bubble-ai'}`}>
-                    {/* Show attachment badge if message has a file */}
                     {m.attachment && (
                       <div className="cw-attach-badge">
                         <FileIcon mime={m.attachment.type} />
@@ -403,13 +452,13 @@ export default function ChatWidget() {
             <div ref={bottomRef} />
           </div>
 
-          {/* Error / mic status banner */}
+          {/* Status bar */}
           {(micError || isListening) && (
             <div className={`cw-status-bar ${isListening ? 'cw-status-bar-listening' : 'cw-status-bar-error'}`}>
               {isListening ? (
                 <>
                   <span className="cw-listening-dot" />
-                  Listening — speak now, click mic to stop
+                  Listening — speak freely, click mic again to stop
                 </>
               ) : micError}
             </div>
@@ -426,16 +475,16 @@ export default function ChatWidget() {
             </div>
           )}
 
-          {/* Input */}
+          {/* Input row */}
           <div className="cw-input-area">
-            <div className="cw-input-row">
+            <div className={`cw-input-row ${isListening ? 'cw-input-row-active' : ''}`}>
 
-              {/* Mic button */}
+              {/* Mic toggle */}
               <button
                 type="button"
-                className={`cw-icon-btn ${isListening ? 'cw-icon-btn-active' : ''}`}
-                onClick={startListening}
-                title={isListening ? 'Stop listening' : 'Voice input'}
+                className={`cw-icon-btn ${isListening ? 'cw-icon-btn-mic-active' : ''}`}
+                onClick={toggleMic}
+                title={isListening ? 'Click to stop recording' : 'Click to start voice input'}
               >
                 {isListening ? <MicOff size={16} /> : <Mic size={16} />}
               </button>
@@ -443,22 +492,22 @@ export default function ChatWidget() {
               <input
                 className="cw-input"
                 value={input}
-                onChange={e => setInput(e.target.value)}
+                onChange={e => { setInput(e.target.value); transcriptRef.current = e.target.value; }}
                 onKeyDown={e => e.key === 'Enter' && !e.shiftKey && send()}
-                placeholder={isListening ? 'Listening…' : 'Ask me anything…'}
+                placeholder={isListening ? '🔴 Recording — speak now…' : 'Ask me anything…'}
               />
 
-              {/* File upload button */}
+              {/* File upload */}
               <button
                 type="button"
                 className={`cw-icon-btn ${attachment ? 'cw-icon-btn-active' : ''}`}
                 onClick={() => fileInputRef.current?.click()}
-                title="Upload: PDF, Word, Excel, PPT, TXT, CSV, MD, JSON, XML, YAML, HTML, Images, Logs"
+                title="Upload file (PDF, Word, Excel, image, text…)"
               >
                 <Paperclip size={16} />
               </button>
 
-              {/* Send button */}
+              {/* Send */}
               <button
                 type="button"
                 onClick={send}
@@ -473,7 +522,7 @@ export default function ChatWidget() {
         </div>
       )}
 
-      {/* ── FAB ─────────────────────────────────────────────── */}
+      {/* ── FAB ──────────────────────────────────────────────── */}
       <div className="cw-fab-wrap">
         {!isOpen && <span className="cw-ping" />}
         <button
@@ -485,177 +534,192 @@ export default function ChatWidget() {
         </button>
       </div>
 
-      {/* ── CSS ─────────────────────────────────────────────── */}
+      {/* ── Styles ───────────────────────────────────────────── */}
       <style>{`
-        /* Window */
         .cw-window {
-          position: fixed; bottom: 5.5rem; right: 2rem;
-          width: 390px; height: 620px; max-height: calc(100vh - 8rem);
-          z-index: 99998; display: flex; flex-direction: column;
-          border-radius: 1.5rem; overflow: hidden;
-          box-shadow: 0 32px 80px rgba(0,0,0,0.65), 0 0 0 1px rgba(255,255,255,0.07);
-          background: #0f1c2e; border: 1px solid rgba(255,255,255,0.08);
-          font-family: inherit;
+          position:fixed; bottom:5.5rem; right:2rem;
+          width:390px; height:620px; max-height:calc(100vh - 8rem);
+          z-index:99998; display:flex; flex-direction:column;
+          border-radius:1.5rem; overflow:hidden;
+          box-shadow:0 32px 80px rgba(0,0,0,.65),0 0 0 1px rgba(255,255,255,.07);
+          background:#0f1c2e; border:1px solid rgba(255,255,255,.08);
+          font-family:inherit;
         }
 
-        /* Header */
+        /* ── Header ── */
         .cw-header {
-          background: linear-gradient(135deg,#0f2234,#0d1f30);
-          border-bottom: 1px solid rgba(255,255,255,0.07);
-          padding: 1rem 1.25rem; display: flex; align-items: center;
-          justify-content: space-between; flex-shrink: 0;
+          background:linear-gradient(135deg,#0f2234,#0d1f30);
+          border-bottom:1px solid rgba(255,255,255,.07);
+          padding:1rem 1.25rem; display:flex; align-items:center;
+          justify-content:space-between; flex-shrink:0;
         }
-        .cw-header-left    { display: flex; align-items: center; gap: 0.75rem; }
-        .cw-header-avatar  {
-          width: 2.5rem; height: 2.5rem; border-radius: 50%;
-          background: linear-gradient(135deg,#10b981,#059669);
-          display: flex; align-items: center; justify-content: center;
-          box-shadow: 0 0 0 3px rgba(16,185,129,0.2); flex-shrink: 0;
+        .cw-header-left   { display:flex; align-items:center; gap:.75rem; }
+        .cw-header-avatar {
+          width:2.5rem; height:2.5rem; border-radius:50%;
+          background:linear-gradient(135deg,#10b981,#059669);
+          display:flex; align-items:center; justify-content:center;
+          box-shadow:0 0 0 3px rgba(16,185,129,.2); flex-shrink:0;
         }
-        .cw-header-title   { color: #fff; font-weight: 700; font-size: 0.875rem; margin: 0; }
-        .cw-header-status  { display: flex; align-items: center; gap: 0.375rem; margin-top: 0.2rem; }
-        .cw-status-dot     { width: 0.45rem; height: 0.45rem; border-radius: 50%; background: #10b981; box-shadow: 0 0 6px #10b981; }
-        .cw-status-text    { color: #10b981; font-size: 0.65rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
-        .cw-close-btn      {
-          background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1);
-          border-radius: 0.5rem; padding: 0.375rem; cursor: pointer; color: #94a3b8;
-          display: flex; align-items: center; justify-content: center;
+        .cw-header-title  { color:#fff; font-weight:700; font-size:.875rem; margin:0; }
+        .cw-header-status { display:flex; align-items:center; gap:.375rem; margin-top:.2rem; }
+        .cw-status-dot    { width:.45rem; height:.45rem; border-radius:50%; background:#10b981; box-shadow:0 0 6px #10b981; transition:background .3s,box-shadow .3s; }
+        .cw-status-dot-mic { background:#f43f5e !important; box-shadow:0 0 8px #f43f5e !important; animation:cwPulse .8s ease-in-out infinite; }
+        .cw-status-text   { color:#10b981; font-size:.65rem; font-weight:700; letter-spacing:.08em; text-transform:uppercase; }
+        .cw-close-btn     {
+          background:rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.1);
+          border-radius:.5rem; padding:.375rem; cursor:pointer; color:#94a3b8;
+          display:flex; align-items:center; justify-content:center;
         }
-        .cw-close-btn:hover { color: #fff; }
+        .cw-close-btn:hover { color:#fff; }
 
-        /* Messages */
+        /* ── Messages ── */
         .cw-messages {
-          flex: 1; overflow-y: auto; padding: 1.25rem 1rem;
-          display: flex; flex-direction: column; gap: 0.9rem;
-          scrollbar-width: thin; scrollbar-color: rgba(255,255,255,0.08) transparent;
+          flex:1; overflow-y:auto; padding:1.25rem 1rem;
+          display:flex; flex-direction:column; gap:.9rem;
+          scrollbar-width:thin; scrollbar-color:rgba(255,255,255,.08) transparent;
         }
 
-        /* Avatar */
+        /* ── Avatar ── */
         .cw-avatar {
-          width: 1.75rem; height: 1.75rem; border-radius: 50%;
-          background: linear-gradient(135deg,#10b981,#059669);
-          display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+          width:1.75rem; height:1.75rem; border-radius:50%;
+          background:linear-gradient(135deg,#10b981,#059669);
+          display:flex; align-items:center; justify-content:center; flex-shrink:0;
         }
-        .cw-avatar-sm { margin-bottom: 2px; }
+        .cw-avatar-sm { margin-bottom:2px; }
 
-        /* Thinking */
-        .cw-thinking-row { display: flex; align-items: flex-end; gap: 0.5rem; }
+        /* ── Thinking ── */
+        .cw-thinking-row { display:flex; align-items:flex-end; gap:.5rem; }
         .cw-thinking-box {
-          background: rgba(16,185,129,0.08); border: 1px solid rgba(16,185,129,0.25);
-          border-radius: 1.1rem 1.1rem 1.1rem 0.25rem;
-          padding: 0.75rem 1rem; display: flex; flex-direction: column; gap: 0.45rem; min-width: 10rem;
+          background:rgba(16,185,129,.08); border:1px solid rgba(16,185,129,.25);
+          border-radius:1.1rem 1.1rem 1.1rem .25rem;
+          padding:.75rem 1rem; display:flex; flex-direction:column; gap:.45rem; min-width:10rem;
         }
-        .cw-thinking-label { display: flex; align-items: center; gap: 0.4rem; color: #10b981; font-size: 0.62rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
-        .cw-bar      { height: 0.25rem; border-radius: 9999px; background: rgba(16,185,129,0.15); overflow: hidden; }
-        .cw-bar-full { width: 100%; }
-        .cw-bar-70   { width: 70%; }
-        .cw-bar-50   { width: 50%; }
-        .cw-bar-fill { height: 100%; border-radius: 9999px; background: linear-gradient(90deg,#10b981,#34d399); }
-        .cw-bar-d0   { animation: cwShimmer 1.4s ease-in-out 0s    infinite; }
-        .cw-bar-d1   { animation: cwShimmer 1.4s ease-in-out 0.15s infinite; }
-        .cw-bar-d2   { animation: cwShimmer 1.4s ease-in-out 0.3s  infinite; }
+        .cw-thinking-label { display:flex; align-items:center; gap:.4rem; color:#10b981; font-size:.62rem; font-weight:700; letter-spacing:.08em; text-transform:uppercase; }
+        .cw-bar      { height:.25rem; border-radius:9999px; background:rgba(16,185,129,.15); overflow:hidden; }
+        .cw-bar-full { width:100%; }
+        .cw-bar-70   { width:70%; }
+        .cw-bar-50   { width:50%; }
+        .cw-bar-fill { height:100%; border-radius:9999px; background:linear-gradient(90deg,#10b981,#34d399); }
+        .cw-bar-d0   { animation:cwShimmer 1.4s ease-in-out 0s    infinite; }
+        .cw-bar-d1   { animation:cwShimmer 1.4s ease-in-out .15s  infinite; }
+        .cw-bar-d2   { animation:cwShimmer 1.4s ease-in-out .3s   infinite; }
 
-        /* Message rows */
-        .cw-msg-row      { display: flex; align-items: flex-end; gap: 0.5rem; }
-        .cw-msg-row-user { justify-content: flex-end; }
-        .cw-msg-row-ai   { justify-content: flex-start; }
+        /* ── Message rows ── */
+        .cw-msg-row      { display:flex; align-items:flex-end; gap:.5rem; }
+        .cw-msg-row-user { justify-content:flex-end; }
+        .cw-msg-row-ai   { justify-content:flex-start; }
 
-        /* Bubbles */
+        /* ── Bubbles ── */
         .cw-bubble {
-          max-width: 78%; padding: 0.65rem 0.9rem; word-break: break-word;
-          line-height: 1.65; font-size: 0.82rem; text-align: left;
+          max-width:78%; padding:.65rem .9rem; word-break:break-word;
+          line-height:1.65; font-size:.82rem; text-align:left;
         }
         .cw-bubble-user {
-          border-radius: 1.1rem 1.1rem 0.25rem 1.1rem;
-          background: linear-gradient(135deg,#10b981,#059669);
-          color: #fff; box-shadow: 0 4px 14px rgba(16,185,129,0.2);
+          border-radius:1.1rem 1.1rem .25rem 1.1rem;
+          background:linear-gradient(135deg,#10b981,#059669);
+          color:#fff; box-shadow:0 4px 14px rgba(16,185,129,.2);
         }
         .cw-bubble-ai {
-          border-radius: 1.1rem 1.1rem 1.1rem 0.25rem;
-          background: rgba(255,255,255,0.055);
-          border: 1px solid rgba(255,255,255,0.09); color: #cbd5e1;
+          border-radius:1.1rem 1.1rem 1.1rem .25rem;
+          background:rgba(255,255,255,.055);
+          border:1px solid rgba(255,255,255,.09); color:#cbd5e1;
         }
 
-        /* Attachment badge inside bubble */
+        /* ── Attach badge in bubble ── */
         .cw-attach-badge {
-          display: flex; align-items: center; gap: 0.35rem;
-          background: rgba(255,255,255,0.15); border-radius: 0.4rem;
-          padding: 0.25rem 0.5rem; margin-bottom: 0.4rem;
-          font-size: 0.72rem; font-weight: 600; color: #fff;
-          width: fit-content;
+          display:flex; align-items:center; gap:.35rem;
+          background:rgba(255,255,255,.15); border-radius:.4rem;
+          padding:.25rem .5rem; margin-bottom:.4rem;
+          font-size:.72rem; font-weight:600; color:#fff; width:fit-content;
         }
 
-        /* Service card */
-        .cw-sc-row  { display: flex; }
+        /* ── Service card ── */
+        .cw-sc-row  { display:flex; }
         .cw-sc-card {
-          background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.1);
-          border-radius: 1rem; padding: 0.875rem 1rem; max-width: 90%;
+          background:rgba(255,255,255,.04); border:1px solid rgba(255,255,255,.1);
+          border-radius:1rem; padding:.875rem 1rem; max-width:90%;
         }
-        .cw-sc-title   { color: #fff; font-weight: 700; font-size: 0.8rem; margin: 0 0 0.35rem; }
-        .cw-sc-badge   { font-size: 0.7rem; font-weight: 700; padding: 0.2rem 0.6rem; border-radius: 999px; display: inline-block; margin-bottom: 0.7rem; }
-        .cw-sc-buttons { display: flex; gap: 0.5rem; flex-wrap: wrap; }
-        .cw-sc-btn     { background: rgba(16,185,129,0.15); border: 1px solid rgba(16,185,129,0.3); color: #10b981; font-size: 0.72rem; font-weight: 600; padding: 0.35rem 0.75rem; border-radius: 0.5rem; cursor: pointer; }
+        .cw-sc-title   { color:#fff; font-weight:700; font-size:.8rem; margin:0 0 .35rem; }
+        .cw-sc-badge   { font-size:.7rem; font-weight:700; padding:.2rem .6rem; border-radius:999px; display:inline-block; margin-bottom:.7rem; }
+        .cw-sc-buttons { display:flex; gap:.5rem; flex-wrap:wrap; }
+        .cw-sc-btn     { background:rgba(16,185,129,.15); border:1px solid rgba(16,185,129,.3); color:#10b981; font-size:.72rem; font-weight:600; padding:.35rem .75rem; border-radius:.5rem; cursor:pointer; }
 
-        /* Status bar (mic listening / error) */
+        /* ── Status bar ── */
         .cw-status-bar {
-          padding: 0.4rem 1rem; font-size: 0.72rem; font-weight: 600;
-          display: flex; align-items: center; gap: 0.4rem; flex-shrink: 0;
+          padding:.4rem 1rem; font-size:.72rem; font-weight:600;
+          display:flex; align-items:center; gap:.4rem; flex-shrink:0;
         }
-        .cw-status-bar-listening { background: rgba(16,185,129,0.12); color: #10b981; border-top: 1px solid rgba(16,185,129,0.2); }
-        .cw-status-bar-error     { background: rgba(239,68,68,0.1);   color: #f87171; border-top: 1px solid rgba(239,68,68,0.2); }
+        .cw-status-bar-listening { background:rgba(244,63,94,.1); color:#fb7185; border-top:1px solid rgba(244,63,94,.25); }
+        .cw-status-bar-error     { background:rgba(239,68,68,.1); color:#f87171; border-top:1px solid rgba(239,68,68,.2); }
         .cw-listening-dot {
-          width: 0.5rem; height: 0.5rem; border-radius: 50%; background: #10b981;
-          animation: cwPulse 1s ease-in-out infinite; flex-shrink: 0;
+          width:.5rem; height:.5rem; border-radius:50%; background:#f43f5e; flex-shrink:0;
+          animation:cwPulse .8s ease-in-out infinite;
         }
 
-        /* Attachment preview bar */
+        /* ── Attachment preview bar ── */
         .cw-attach-preview {
-          display: flex; align-items: center; gap: 0.5rem;
-          padding: 0.4rem 1rem; background: rgba(16,185,129,0.08);
-          border-top: 1px solid rgba(16,185,129,0.2); flex-shrink: 0;
-          color: #10b981; font-size: 0.75rem; font-weight: 600;
+          display:flex; align-items:center; gap:.5rem;
+          padding:.4rem 1rem; background:rgba(16,185,129,.08);
+          border-top:1px solid rgba(16,185,129,.2); flex-shrink:0;
+          color:#10b981; font-size:.75rem; font-weight:600;
         }
-        .cw-attach-name   { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .cw-attach-name   { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
         .cw-attach-remove {
-          background: none; border: none; cursor: pointer; color: #64748b;
-          display: flex; align-items: center; padding: 0.1rem;
-          border-radius: 0.25rem;
+          background:none; border:none; cursor:pointer; color:#64748b;
+          display:flex; align-items:center; padding:.1rem; border-radius:.25rem;
         }
-        .cw-attach-remove:hover { color: #f87171; }
+        .cw-attach-remove:hover { color:#f87171; }
 
-        /* Input area */
-        .cw-input-area { padding: 0.875rem 1rem; border-top: 1px solid rgba(255,255,255,0.07); background: #0b1826; flex-shrink: 0; }
-        .cw-input-row  { display: flex; align-items: center; gap: 0.5rem; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); border-radius: 0.875rem; padding: 0.3rem 0.5rem 0.3rem 0.75rem; }
-        .cw-icon-btn   { background: none; border: none; cursor: pointer; color: #64748b; display: flex; align-items: center; padding: 0.25rem; border-radius: 0.35rem; transition: all 0.15s; }
-        .cw-icon-btn:hover       { color: #10b981; }
-        .cw-icon-btn-active      { color: #10b981 !important; background: rgba(16,185,129,0.15); }
-        .cw-input                { flex: 1; background: transparent; border: none; outline: none; color: #e2e8f0; font-size: 0.82rem; padding: 0.5rem 0; caret-color: #10b981; }
-        .cw-input::placeholder   { color: #475569; }
-        .cw-send-btn             { border: none; border-radius: 0.6rem; padding: 0.45rem 0.55rem; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: all 0.2s; cursor: pointer; }
-        .cw-send-btn-active      { background: linear-gradient(135deg,#10b981,#059669); color: #fff; box-shadow: 0 2px 8px rgba(16,185,129,0.3); }
-        .cw-send-btn-idle        { background: rgba(255,255,255,0.06); color: #475569; cursor: default; }
-        .cw-footer-text          { color: #1e3a5f; font-size: 0.62rem; text-align: center; margin-top: 0.45rem; }
+        /* ── Input area ── */
+        .cw-input-area { padding:.875rem 1rem; border-top:1px solid rgba(255,255,255,.07); background:#0b1826; flex-shrink:0; }
+        .cw-input-row {
+          display:flex; align-items:center; gap:.5rem;
+          background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.1);
+          border-radius:.875rem; padding:.3rem .5rem .3rem .75rem;
+          transition:border-color .2s, background .2s;
+        }
+        .cw-input-row-active { border-color:rgba(244,63,94,.5) !important; background:rgba(244,63,94,.04) !important; }
 
-        /* FAB */
-        .cw-fab-wrap { position: fixed; bottom: 2rem; right: 2rem; z-index: 99999; }
+        .cw-icon-btn { background:none; border:none; cursor:pointer; color:#64748b; display:flex; align-items:center; padding:.25rem; border-radius:.35rem; transition:all .15s; }
+        .cw-icon-btn:hover         { color:#10b981; }
+        .cw-icon-btn-active        { color:#10b981 !important; background:rgba(16,185,129,.15); }
+        .cw-icon-btn-mic-active    {
+          color:#f43f5e !important;
+          background:rgba(244,63,94,.15) !important;
+          border-radius:.35rem;
+          animation:cwMicGlow 1s ease-in-out infinite;
+        }
+
+        .cw-input              { flex:1; background:transparent; border:none; outline:none; color:#e2e8f0; font-size:.82rem; padding:.5rem 0; caret-color:#10b981; }
+        .cw-input::placeholder { color:#475569; }
+
+        .cw-send-btn        { border:none; border-radius:.6rem; padding:.45rem .55rem; display:flex; align-items:center; justify-content:center; flex-shrink:0; transition:all .2s; cursor:pointer; }
+        .cw-send-btn-active { background:linear-gradient(135deg,#10b981,#059669); color:#fff; box-shadow:0 2px 8px rgba(16,185,129,.3); }
+        .cw-send-btn-idle   { background:rgba(255,255,255,.06); color:#475569; cursor:default; }
+
+        .cw-footer-text { color:#1e3a5f; font-size:.62rem; text-align:center; margin-top:.45rem; }
+
+        /* ── FAB ── */
+        .cw-fab-wrap { position:fixed; bottom:2rem; right:2rem; z-index:99999; }
         .cw-fab {
-          width: 3.25rem; height: 3.25rem; border-radius: 50%; cursor: pointer; color: #fff;
-          display: flex; align-items: center; justify-content: center;
-          transition: all 0.25s cubic-bezier(0.34,1.56,0.64,1);
+          width:3.25rem; height:3.25rem; border-radius:50%; cursor:pointer; color:#fff;
+          display:flex; align-items:center; justify-content:center;
+          transition:all .25s cubic-bezier(.34,1.56,.64,1);
         }
-        .cw-fab-open   { background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.15); box-shadow: none; }
-        .cw-fab-closed { background: linear-gradient(135deg,#10b981,#059669); border: none; box-shadow: 0 8px 24px rgba(16,185,129,0.45); }
-        .cw-fab:hover  { transform: scale(1.08); }
+        .cw-fab-open   { background:rgba(255,255,255,.1); border:1px solid rgba(255,255,255,.15); box-shadow:none; }
+        .cw-fab-closed { background:linear-gradient(135deg,#10b981,#059669); border:none; box-shadow:0 8px 24px rgba(16,185,129,.45); }
+        .cw-fab:hover  { transform:scale(1.08); }
         .cw-ping {
-          position: absolute; inset: -3px; border-radius: 50%;
-          border: 2px solid rgba(16,185,129,0.35);
-          animation: cwPing 2s ease-out infinite; pointer-events: none;
+          position:absolute; inset:-3px; border-radius:50%;
+          border:2px solid rgba(16,185,129,.35);
+          animation:cwPing 2s ease-out infinite; pointer-events:none;
         }
 
-        /* Keyframes */
-        @keyframes cwShimmer { 0%{transform:translateX(-100%)} 100%{transform:translateX(200%)} }
-        @keyframes cwPing    { 0%{transform:scale(1);opacity:0.5} 100%{transform:scale(1.6);opacity:0} }
-        @keyframes cwPulse   { 0%,100%{opacity:1} 50%{opacity:0.3} }
+        /* ── Keyframes ── */
+        @keyframes cwShimmer  { 0%{transform:translateX(-100%)} 100%{transform:translateX(200%)} }
+        @keyframes cwPing     { 0%{transform:scale(1);opacity:.5} 100%{transform:scale(1.6);opacity:0} }
+        @keyframes cwPulse    { 0%,100%{opacity:1} 50%{opacity:.3} }
+        @keyframes cwMicGlow  { 0%,100%{box-shadow:0 0 0 0 rgba(244,63,94,.5)} 50%{box-shadow:0 0 0 5px rgba(244,63,94,0)} }
       `}</style>
     </>
   );
